@@ -67,6 +67,8 @@ README_TEXT = r"""
 
 - 원클릭 분류 버튼은 입력칸이 비어 있으면 자동 임계값을 새로 계산하고, 값이 적혀 있으면 **동일 임계값으로**
   분류 실행 버튼과 동일한 로직을 그대로 사용합니다.
+- 좌측 옵션 패널은 스크롤바와 마우스 휠로 끝까지 이동할 수 있으니 Noise/Shape/ML 토글이 화면 아래로 숨겨져도
+  스크롤만 하면 모두 접근할 수 있습니다.
 
 Shot-Aware 사용법:
 - Shot-Aware 모드 ON → 샷 정규식 입력 → 샷 최소 개수 설정(기본 3) → 샷 보정 사용 체크.
@@ -1373,6 +1375,25 @@ def launch_gui():
                 _log(f"{row.decision}\t{row.stage}\tml={row.ml_label}:{row.ml_score:.2f}\ts11cc={row.s11_cc}\t"
                      f"r={row.r:.4f}\trmse={row.rmse_db:.3f}\tshot={row.shot_id}/{row.used_golden}\tguards={row.guards}\t{row.path}")
 
+            stage_hist: Dict[str, int] = {}
+            guard_hist: Dict[str, int] = {}
+            for row in results:
+                stage = row.stage or "-"
+                stage_hist[stage] = stage_hist.get(stage, 0) + 1
+                if row.guards:
+                    for raw_flag in row.guards.split(';'):
+                        flag = raw_flag.strip()
+                        if flag:
+                            guard_hist[flag] = guard_hist.get(flag, 0) + 1
+
+            if stage_hist:
+                ordered = ", ".join(f"{k}:{v}" for k, v in sorted(stage_hist.items(), key=lambda kv: (-kv[1], kv[0])))
+                _log(f"[Stage 분포] {ordered}")
+            if guard_hist:
+                top = sorted(guard_hist.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+                formatted = ", ".join(f"{name}×{cnt}" for name, cnt in top)
+                _log(f"[Guard 트리거 TOP] {formatted}")
+
             _update_lists_and_summary(results, used_r, used_e)
 
             state["g_freq"]=g_freq; state["g_curve"]=g_curve; state["domain"]=domain; state["fmin"]=fmin; state["fmax"]=fmax; state["compare"]=compare_mode; state["shot_map"]=shot_map
@@ -1401,9 +1422,49 @@ def launch_gui():
     frm.columnconfigure(0, weight=0); frm.columnconfigure(1, weight=1)
     frm.rowconfigure(0, weight=1)
 
-    # Left column
-    left = ttk.Frame(frm); left.grid(row=0, column=0, sticky='nsw')
+    # Left column (scrollable so noise/shape/ML 패널이 모두 보임)
+    left_container = ttk.Frame(frm)
+    left_container.grid(row=0, column=0, sticky='nsw')
+    left_container.rowconfigure(0, weight=1); left_container.columnconfigure(0, weight=1)
+
+    left_canvas = tk.Canvas(left_container, highlightthickness=0, borderwidth=0, width=600)
+    left_scroll = ttk.Scrollbar(left_container, orient='vertical', command=left_canvas.yview)
+    left_canvas.grid(row=0, column=0, sticky='nsw')
+    left_scroll.grid(row=0, column=1, sticky='ns')
+    left_canvas.configure(yscrollcommand=left_scroll.set)
+
+    left = ttk.Frame(left_canvas)
+    left_window = left_canvas.create_window((0, 0), window=left, anchor='nw')
+
+    def _sync_left_scrollregion(_event=None):
+        left_canvas.configure(scrollregion=left_canvas.bbox('all'))
+    left.bind('<Configure>', _sync_left_scrollregion)
+
+    def _stretch_left_frame(event):
+        left_canvas.itemconfigure(left_window, width=event.width)
+    left_canvas.bind('<Configure>', _stretch_left_frame)
+
+    def _on_mousewheel(event):
+        delta = getattr(event, 'delta', 0)
+        num = getattr(event, 'num', None)
+        if num == 4 or delta > 0:
+            left_canvas.yview_scroll(-1, 'units')
+        elif num == 5 or delta < 0:
+            left_canvas.yview_scroll(1, 'units')
+
+    def _bind_scroll(widget):
+        widget.bind('<Enter>', lambda _e: (win.bind_all('<MouseWheel>', _on_mousewheel),
+                                          win.bind_all('<Button-4>', _on_mousewheel),
+                                          win.bind_all('<Button-5>', _on_mousewheel)))
+        widget.bind('<Leave>', lambda _e: (win.unbind_all('<MouseWheel>'),
+                                          win.unbind_all('<Button-4>'),
+                                          win.unbind_all('<Button-5>')))
+
+    _bind_scroll(left_canvas)
+    _bind_scroll(left)
+
     ctl = ttk.Frame(left); ctl.pack(fill='x')
+    _bind_scroll(ctl)
 
     ttk.Label(ctl, text="--root").grid(row=0, column=0, sticky='w')
     root_var = tk.StringVar(); ttk.Entry(ctl, textvariable=root_var, width=46).grid(row=0, column=1, sticky='w', padx=5)
@@ -1470,6 +1531,7 @@ def launch_gui():
 
     # PASS/FAIL lists
     lists = ttk.Frame(left); lists.pack(fill='both', expand=True, pady=(10,6))
+    _bind_scroll(lists)
     pass_header = ttk.Label(lists, text="PASS 목록"); fail_header = ttk.Label(lists, text="FAIL 목록")
     pass_header.grid(row=0, column=0, sticky='w'); fail_header.grid(row=0, column=1, sticky='w')
     pass_xsb = ttk.Scrollbar(lists, orient='horizontal'); fail_xsb = ttk.Scrollbar(lists, orient='horizontal')
@@ -1482,6 +1544,7 @@ def launch_gui():
 
     # List buttons + context menu
     list_btns = ttk.Frame(left); list_btns.pack(fill='x', pady=(4,10))
+    _bind_scroll(list_btns)
     ttk.Button(list_btns, text="선택 오버레이", command=overlay_from_selection).pack(side='left', padx=3)
     ttk.Button(list_btns, text="PASS 전체 선택", command=lambda: (pass_list.select_set(0, 'end'))).pack(side='left', padx=3)
     ttk.Button(list_btns, text="FAIL 전체 선택", command=lambda: (fail_list.select_set(0, 'end'))).pack(side='left', padx=3)
@@ -1547,6 +1610,7 @@ def launch_gui():
     # ----- Gates panel (v3.8) -----
     gatefrm = ttk.LabelFrame(left, text="Noise/Shape Gate (v3.8)")
     gatefrm.pack(fill='x', pady=(6,4))
+    _bind_scroll(gatefrm)
 
     var_use_noise = tk.BooleanVar(value=False)
     var_use_shape = tk.BooleanVar(value=False)
@@ -1576,6 +1640,7 @@ def launch_gui():
     # ----- Shot-aware / Shape 강화 (rev7.0 호환) -----
     shotfrm = ttk.LabelFrame(left, text="Shot-Aware / Shape Guards (rev7.0)")
     shotfrm.pack(fill='x', pady=(6,4))
+    _bind_scroll(shotfrm)
 
     var_shot_aware = tk.BooleanVar(value=True)
     ttk.Checkbutton(shotfrm, text="Shot-Aware 모드", variable=var_shot_aware).grid(row=0, column=0, sticky='w', padx=4, pady=2)
@@ -1612,6 +1677,7 @@ def launch_gui():
     # ----- ML / Cross-check panel -----
     mlfrm = ttk.LabelFrame(left, text="ML / Cross-check (rev7.0)")
     mlfrm.pack(fill='x', pady=(8,6))
+    _bind_scroll(mlfrm)
 
     good_root_var = tk.StringVar(); bad_root_var = tk.StringVar()
     ttk.Label(mlfrm, text="GOOD 폴더").grid(row=0, column=0, sticky='w', padx=4)
