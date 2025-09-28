@@ -57,7 +57,10 @@ README_TEXT = r"""
    - --label_map_csv path.csv 를 전달하면 혼동행렬(FP/FN) 로그를 출력.
 3) 모델 학습: python ... fit --good_root GOOD --bad_root BAD --out model.json
    - JSON에는 Y11/S11 골든과 임계치, 피처 파라미터가 저장되며 classify에서 --ml_model_path로 사용.
-   - rev5 ML은 r/rmse + 노이즈/피크 특징에 notch/선형성/좌우 비대칭/피크 이동량까지 포함하여 왜곡 샘플을 정밀 분리.
+- rev5 ML은 r/rmse + 노이즈/피크 특징에 notch/선형성/좌우 비대칭/피크 이동량까지 포함하여 왜곡 샘플을 정밀 분리.
+- ML 데이터셋 가이드: GOOD/BAD 각각 최소 20~30개(가능하면 50개 이상)를 목표로 하되, 샷 단위가 크면 샷별로 균형 있게
+  포함시키세요. 적어도 서로 다른 샷 3개 이상에서 샘플을 수집하면 Shot-aware 골든과 중복되지 않는 일반화 성능을 얻을
+  수 있습니다. 데이터가 적을 때는 FLEX 완화폭을 줄이고 ML을 WARN 모드로 두어 과적합 위험을 줄이세요.
 
 Shot-Aware 사용법:
 - Shot-Aware 모드 ON → 샷 정규식 입력 → 샷 최소 개수 설정(기본 3) → 샷 보정 사용 체크.
