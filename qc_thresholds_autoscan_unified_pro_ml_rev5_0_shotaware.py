@@ -11,6 +11,7 @@ STRICT superset of rev4.0 (원코드 삭제/수정 없음, 기능만 추가).
    - 글로벌 골든을 기준으로 1차 STRICT 판정 → 샷별 로컬 골든과 보정계수로 2차 FLEX 재평가.
    - 샷별 보정: 글로벌 ↔ 로컬 골든 차이를 저차항(polynomial)으로 추정하여 offset/scale/약한
      비선형을 흡수(ShotCorrection).
+   - 글로벌 골든 기준으로 근소하게 빗나간 커브는 RELAX 단계 완화(경계 PASS)로 FN 억제.
 2) Shape Guard 고도화
    - 노치/이빨 빠짐/비정상 폭 탐지: 로컬 기울기, 2차 차분, prominence, FWHM, peak count 분석.
    - 리니어리티 가드: 공진 영역 외 대역이 과도하게 직선/평탄하면 FAIL/WARN.
@@ -61,6 +62,8 @@ Shot-Aware 사용법:
 - Shot-Aware 모드 ON → 샷 정규식 입력 → 샷 최소 개수 설정(기본 3) → 샷 보정 사용 체크.
 - 샷 보정은 글로벌 골든 대비 offset/scale/2차 보정으로 스플릿 차이를 흡수.
 - Shot relax × 파라미터(기본 1.15)와 ML=GOOD 시 자동 완화로 FLEX PASS를 조절.
+- 글로벌 RELAX 완화는 r이 기준보다 약간 낮고 rmse가 근소하게 높은 경우(Guard 경고 없음, ML이 BAD가 아닐 때)
+  최종 PASS로 승격하여 양품 오판정을 줄임.
 
 Guard 설정:
 - Shape/Noise gate는 기존 min_prom, FWHM, roughness 기반.
@@ -71,7 +74,7 @@ S11 Cross-Check:
 - classify에서 --s11_crosscheck --s11_cc_mode FAIL (--s11_cc_relax 1.25) 형태로 사용 권장.
 
 CSV/로그:
-- _qc_results/qc_results.csv 에 stage, ml_label, s11_cc, shot_id, used_golden, guards 열이 포함.
+- _qc_results/qc_results.csv 에 stage(STRICT/FLEX/RELAX/SHOT), ml_label, s11_cc, shot_id, used_golden, guards 열이 포함.
 - classify 실행 시 혼동행렬과 FP/FN 비율을 출력하며, GUI/CLI 모두 상위 5개 결과를 미리보기로 보여줌.
 """
 
@@ -583,7 +586,7 @@ class QCResult:
     fwhm_mhz: Optional[float] = None
     gate_notes: str = ""
     # rev4.0 추가
-    stage: str = "NONE"         # STRICT / FLEX / NONE
+    stage: str = "NONE"         # STRICT / FLEX / RELAX / SHOT / NONE
     ml_label: str = "NA"        # GOOD/BAD/NA
     ml_score: float = 0.5       # sigmoid(score)
     s11_cc: str = "NA"          # OK/WARN/FAIL
@@ -803,6 +806,16 @@ def classify_folder(root: str, golden_mode: str, golden_path: Optional[str], fmi
                 stage = "SHOT"
                 used_golden = "shot"
                 m_effective = shot_metrics
+
+        # ---- Global RELAX fallback (near-miss curves without guard objections) ----
+        if (not pass12) and base_decision == 'PASS':
+            r_soft = max(0.0, use_r - 0.015 * relax_factor)
+            e_soft = use_e * (relax_factor + 0.10)
+            if (m.r >= r_soft) and (m.rmse_db <= e_soft) and (ml_label != "BAD"):
+                if not guard_flags:
+                    pass12 = True
+                    stage = "RELAX"
+                    m_effective = m
 
         # ---- S11 cross-check ----
         s11cc = "NA"
