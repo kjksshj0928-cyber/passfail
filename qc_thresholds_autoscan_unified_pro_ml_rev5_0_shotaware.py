@@ -29,6 +29,8 @@ STRICT superset of rev4.0 (원코드 삭제/수정 없음, 기능만 추가).
 의존성: numpy, tkinter, matplotlib (scikit-learn 불필요; LDA는 내장구현)
 """
 
+from __future__ import annotations
+
 import os, sys, csv, json, argparse, platform, subprocess, math
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Iterable
@@ -39,7 +41,7 @@ except Exception:
     print("[에러] numpy 필요. pip install numpy")
     raise
 
-README_TEXT = """
+README_TEXT = r"""
 [rev5.0 ShotAware README]
 의존성: python3, numpy, tkinter, matplotlib (GUI용). CLI에서는 --no_gui와 함께 사용 가능.
 
@@ -49,7 +51,7 @@ README_TEXT = """
    - Shot-Aware 모드를 ON으로 두면 샷 정규식(기본 SHOT(\d+))과 최소 샷 개수를 기준으로 로컬 골든을 생성.
    - ML/교차검증 패널에서 GOOD/BAD 폴더로 LDA 학습 후 모델 저장/불러오기.
    - S11 Cross-check를 WARN 또는 FAIL 모드로 켜서 접촉 불량/평탄 착시를 차단.
-2) CLI 원클릭: python ... classify --root <폴더> [--shot_aware --shot_regex "SHOT(\\d+)" --shot_use_correction]
+2) CLI 원클릭: python ... classify --root <폴더> [--shot_aware --shot_regex 'SHOT(\d+)' --shot_use_correction]
    - 기본값으로 MAD 기반 임계치를 자동 산출.
    - --label_map_csv path.csv 를 전달하면 혼동행렬(FP/FN) 로그를 출력.
 3) 모델 학습: python ... fit --good_root GOOD --bad_root BAD --out model.json
