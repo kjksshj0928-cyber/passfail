@@ -57,6 +57,7 @@ README_TEXT = r"""
    - --label_map_csv path.csv 를 전달하면 혼동행렬(FP/FN) 로그를 출력.
 3) 모델 학습: python ... fit --good_root GOOD --bad_root BAD --out model.json
    - JSON에는 Y11/S11 골든과 임계치, 피처 파라미터가 저장되며 classify에서 --ml_model_path로 사용.
+   - rev5 ML은 r/rmse + 노이즈/피크 특징에 notch/선형성/좌우 비대칭/피크 이동량까지 포함하여 왜곡 샘플을 정밀 분리.
 
 Shot-Aware 사용법:
 - Shot-Aware 모드 ON → 샷 정규식 입력 → 샷 최소 개수 설정(기본 3) → 샷 보정 사용 체크.
@@ -349,6 +350,90 @@ def detect_shape_anomalies(freq: np.ndarray, y_db: np.ndarray, domain: str,
         issues.append(f"NOISE rough={rough:.2f}dB")
     return issues
 
+
+def shape_feature_summary(freq: np.ndarray, sample_db: np.ndarray, golden_db: np.ndarray,
+                          domain: str, smooth_win: int) -> Dict[str, float]:
+    freq = np.asarray(freq, float)
+    sample_db = np.asarray(sample_db, float)
+    golden_db = np.asarray(golden_db, float)
+    if freq.size < 5 or sample_db.size != freq.size:
+        return {
+            "peak_prom_db": 0.0,
+            "fwhm_mhz": 0.0,
+            "notch_depth_db": 0.0,
+            "multi_peak_score": 0.0,
+            "linear_rmse_db": 0.0,
+            "flank_skew_db": 0.0,
+            "peak_shift_mhz": 0.0,
+        }
+
+    smooth = int(max(5, smooth_win))
+    y_s = _movavg(sample_db, smooth)
+    g_s = _movavg(golden_db, smooth)
+
+    idx = _peak_index(y_s, domain)
+    g_idx = _peak_index(g_s, domain)
+    idx = int(np.clip(idx, 0, len(freq) - 1))
+    g_idx = int(np.clip(g_idx, 0, len(freq) - 1))
+
+    prom, fwhm = peak_prominence_and_fwhm(freq, sample_db, domain, smooth_win=smooth)
+    peak_freq = float(freq[idx])
+    golden_peak_freq = float(freq[g_idx])
+    peak_shift_mhz = float(abs(peak_freq - golden_peak_freq) / 1e6)
+
+    window = max(6, int(0.02 * len(freq)))
+    lo = max(0, idx - window)
+    hi = min(len(freq), idx + window)
+    seg = y_s[lo:hi]
+    peak_val = float(y_s[idx])
+    if seg.size >= 2:
+        if domain == 'Y11_DB':
+            notch_depth = float(np.max(peak_val - seg))
+        else:
+            notch_depth = float(np.max(seg - peak_val))
+    else:
+        notch_depth = 0.0
+
+    dy = np.gradient(y_s, freq, edge_order=1)
+    sign_changes = float(_count_sign_changes(dy))
+
+    if fwhm > 0:
+        spacing = float(np.median(np.diff(freq))) if freq.size > 1 else 1.0
+        half_span = max(3, int((fwhm * 1e6) / max(1.0, spacing)))
+    else:
+        half_span = max(3, int(0.02 * len(freq)))
+    mask = np.ones_like(freq, dtype=bool)
+    mask[max(0, idx - half_span):min(len(freq), idx + half_span)] = False
+
+    linear_rmse = 0.0
+    if np.count_nonzero(mask) > 4:
+        f_lin = freq[mask]
+        y_lin = y_s[mask]
+        A = np.vstack([f_lin, np.ones_like(f_lin)]).T
+        try:
+            beta, *_ = np.linalg.lstsq(A, y_lin, rcond=None)
+            resid = y_lin - (A @ beta)
+            linear_rmse = float(np.sqrt(np.mean(resid ** 2)))
+        except Exception:
+            linear_rmse = 0.0
+
+    left = y_s[max(0, idx - half_span):idx]
+    right = y_s[idx + 1:min(len(y_s), idx + 1 + half_span)]
+    if left.size and right.size:
+        flank_skew = float(abs(np.median(left) - np.median(right)))
+    else:
+        flank_skew = 0.0
+
+    return {
+        "peak_prom_db": float(prom),
+        "fwhm_mhz": float(fwhm),
+        "notch_depth_db": notch_depth,
+        "multi_peak_score": sign_changes,
+        "linear_rmse_db": linear_rmse,
+        "flank_skew_db": flank_skew,
+        "peak_shift_mhz": peak_shift_mhz,
+    }
+
 # ============================ Golden Builders ============================
 
 def build_golden_auto(files: List[str], domain: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -433,24 +518,52 @@ def build_shot_goldens(files: Iterable[str], domain: str, regex: Optional[str],
 
 # ============================ ML: Features / LDA ============================
 
+ML_FEATURE_NAMES_REV5 = [
+    "r_good", "rmse_good", "r_bad", "rmse_bad",
+    "noise_rms_db", "peak_prom_db", "fwhm_mhz",
+    "notch_depth_db", "linear_rmse_db", "multi_peak_score",
+    "flank_skew_db", "peak_shift_mhz",
+]
+
+
 def _compute_basic_features(sp: S1P, g_freq_good, g_curve_good, g_freq_bad, g_curve_bad,
-                            fmin, fmax, domain, compare_mode, smooth_win=31) -> np.ndarray:
+                            fmin, fmax, domain, compare_mode, smooth_win=31) -> Dict[str, float]:
     y = curve_in_domain(sp, domain)
     # good/bad metrics (각 골든 그리드에서 계산)
     m_g = compute_metrics(sp, g_freq_good, g_curve_good, fmin, fmax, domain, compare_mode)
     m_b = compute_metrics(sp, g_freq_bad,  g_curve_bad,  fmin, fmax, domain, compare_mode)
+
+    feats: Dict[str, float] = {
+        "r_good": float(m_g.r),
+        "rmse_good": float(m_g.rmse_db),
+        "r_bad": float(m_b.r),
+        "rmse_bad": float(m_b.rmse_db),
+        "noise_rms_db": 0.0,
+        "peak_prom_db": 0.0,
+        "fwhm_mhz": 0.0,
+        "notch_depth_db": 0.0,
+        "linear_rmse_db": 0.0,
+        "multi_peak_score": 0.0,
+        "flank_skew_db": 0.0,
+        "peak_shift_mhz": 0.0,
+    }
+
     # noise/shape on good grid with ROI
     y_good = resample_to(sp.freq_hz, y, g_freq_good)
     mask = np.ones_like(g_freq_good, dtype=bool)
-    if fmin is not None: mask &= (g_freq_good>=fmin)
-    if fmax is not None: mask &= (g_freq_good<=fmax)
-    yf = y_good[mask]; ff = g_freq_good[mask]
-    if yf.size < 5:
-        nr, pr, fw = 0.0, 0.0, 0.0
-    else:
-        nr = noise_rms_db(yf, smooth_win)
-        pr, fw = peak_prominence_and_fwhm(ff, yf, domain, smooth_win)
-    return np.array([m_g.r, m_g.rmse_db, m_b.r, m_b.rmse_db, nr, pr, fw], float)
+    if fmin is not None:
+        mask &= (g_freq_good >= fmin)
+    if fmax is not None:
+        mask &= (g_freq_good <= fmax)
+    yf = y_good[mask]
+    ff = g_freq_good[mask]
+    g_ref = g_curve_good[mask]
+    if yf.size >= 5:
+        feats["noise_rms_db"] = float(noise_rms_db(yf, smooth_win))
+        shape_feats = shape_feature_summary(ff, yf, g_ref, domain, smooth_win)
+        feats.update(shape_feats)
+
+    return feats
 
 def _fit_lda(X_good: np.ndarray, X_bad: np.ndarray) -> Dict[str, np.ndarray]:
     mu_g = X_good.mean(axis=0); mu_b = X_bad.mean(axis=0)
@@ -494,13 +607,18 @@ def fit_ml_model(good_root: str, bad_root: str, domain: str, compare_mode: str,
     g_freq_g, g_curve_g = build_golden_auto(good_files, domain)
     g_freq_b, g_curve_b = build_golden_auto(bad_files,  domain)
     # features
+    feature_order = list(ML_FEATURE_NAMES_REV5)
     Xg = []; Xb = []
     for p in good_files:
         sp = parse_s1p(p)
-        Xg.append(_compute_basic_features(sp, g_freq_g, g_curve_g, g_freq_b, g_curve_b, fmin, fmax, domain, compare_mode, smooth_win))
+        feats = _compute_basic_features(sp, g_freq_g, g_curve_g, g_freq_b, g_curve_b,
+                                        fmin, fmax, domain, compare_mode, smooth_win)
+        Xg.append([feats.get(name, 0.0) for name in feature_order])
     for p in bad_files:
         sp = parse_s1p(p)
-        Xb.append(_compute_basic_features(sp, g_freq_g, g_curve_g, g_freq_b, g_curve_b, fmin, fmax, domain, compare_mode, smooth_win))
+        feats = _compute_basic_features(sp, g_freq_g, g_curve_g, g_freq_b, g_curve_b,
+                                        fmin, fmax, domain, compare_mode, smooth_win)
+        Xb.append([feats.get(name, 0.0) for name in feature_order])
     Xg = np.vstack(Xg); Xb = np.vstack(Xb)
     lda = _fit_lda(Xg, Xb)
 
@@ -510,8 +628,8 @@ def fit_ml_model(good_root: str, bad_root: str, domain: str, compare_mode: str,
     s11_rmin, s11_rmse = auto_thresholds_mad(mets_s11, k_sigma=3.0)
 
     model = dict(
-        version="rev4.0",
-        feature_names=["r_good","rmse_good","r_bad","rmse_bad","noise_rms_db","peak_prom_db","fwhm_mhz"],
+        version="rev5.0",
+        feature_names=feature_order,
         domain=domain, compare_mode=compare_mode, fmin=fmin, fmax=fmax, smooth_win=int(smooth_win),
         good_golden=dict(freq=g_freq_g.tolist(), curve=g_curve_g.tolist()),
         bad_golden=dict(freq=g_freq_b.tolist(), curve=g_curve_b.tolist()),
@@ -536,7 +654,9 @@ def predict_with_model(sp: S1P, model: Dict) -> Tuple[str, float, np.ndarray]:
     gg = model["good_golden"]; gb = model["bad_golden"]
     g_freq_g = np.asarray(gg["freq"], float); g_curve_g = np.asarray(gg["curve"], float)
     g_freq_b = np.asarray(gb["freq"], float); g_curve_b = np.asarray(gb["curve"], float)
-    x = _compute_basic_features(sp, g_freq_g, g_curve_g, g_freq_b, g_curve_b, fmin, fmax, dom, cmp, sw)
+    feat_map = _compute_basic_features(sp, g_freq_g, g_curve_g, g_freq_b, g_curve_b, fmin, fmax, dom, cmp, sw)
+    names = model.get("feature_names") or ["r_good","rmse_good","r_bad","rmse_bad","noise_rms_db","peak_prom_db","fwhm_mhz"]
+    x = np.array([feat_map.get(name, 0.0) for name in names], float)
     lda = model["lda"]
     w = np.asarray(lda["w"], float); c = float(lda["c"])
     z = _lda_score(x, w, c)
