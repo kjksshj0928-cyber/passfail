@@ -52,7 +52,9 @@ README_TEXT = r"""
 1) GUI 실행: python qc_thresholds_autoscan_unified_pro_ml_rev6_0_shotaware.py
    - 좌측에서 --root를 지정 후 Auto 추천 또는 Load Thresholds.
    - "임계값 고정" 체크를 켜면 Auto/MAD/Quantile로 얻은 r_min, rmse_max를 그대로 사용한다.
+   - "골든 고정"을 활성화하면 현재 골든을 `_qc_results/golden_cache.json`에 저장해 이후 FAIL 샘플을 추가해도 기준이 유지된다. 필요 시 "캐시 초기화" 버튼으로 재계산한다.
    - 좌측 패널은 마우스 휠로 스크롤 가능하며 Gate / Shot / ML / Cross-check 섹션을 순서대로 배치했다.
+   - 상단 "간편 프리셋" 콤보에서 `기본`, `양품 보호`, `불량 차단` 감도 세트를 즉시 적용해 수치 입력 없이도 FP/FN 균형을 맞출 수 있다.
    - Shot-Aware 모드를 ON으로 두면 샷 정규식(기본 SHOT(\d+))과 최소 샷 개수를 기준으로 로컬 골든을 생성.
    - Strict Noise Guard 슬라이더/입력으로 Y11 곡선에서 미세 노이즈도 FAIL로 처리할 강도를 지정.
    - ML/교차검증 패널에서 GOOD/BAD 폴더로 LDA 학습 후 모델 저장/불러오기.
@@ -60,7 +62,8 @@ README_TEXT = r"""
 2) CLI 원클릭: python ... classify --root <폴더> [--shot_aware --shot_regex 'SHOT(\d+)' --shot_use_correction]
    - 기본값으로 MAD 기반 임계치를 자동 산출.
    - --label_map_csv path.csv 를 전달하면 혼동행렬(FP/FN) 로그를 출력.
-   - Y11 잡음이 조금이라도 존재하면 --strict_noise_db 0.12 처럼 임계치를 더 낮춰 강제 FAIL.
+   - 엄격한 노이즈 검출이 필요할 때 --strict_noise_db 0.12 처럼 임계치를 낮춰 강제 FAIL (기본은 0으로 비활성).
+   - Auto 골든을 유지하려면 --lock_golden (--golden_cache_path custom.json) 옵션을 사용한다.
 3) 모델 학습: python ... fit --good_root GOOD --bad_root BAD --out model.json
    - JSON에는 Y11/S11 골든과 임계치, 피처 파라미터가 저장되며 classify에서 --ml_model_path로 사용.
    - rev6 ML은 r/rmse + 노이즈/피크 + notch/선형성/좌우 비대칭/피크 이동량 특징을 학습하며 S11 교차검증 임계치도 함께 저장.
@@ -74,6 +77,11 @@ ML 학습 절차 예시:
 3. 분류 시 python ... classify --root TARGET --ml_model_path qc_ml_model_rev6.json \
       --shot_aware --shot_regex 'SHOT(\\d+)' --s11_crosscheck --strict_noise_db 0.12
 4. GUI에서는 GOOD/BAD 폴더 선택 → "Fit & Save 모델" → 저장된 JSON을 classify 패널에서 불러오기.
+
+Golden 스냅샷 잠금:
+- Auto 골든을 만든 뒤 "골든 고정"을 켜고 분류하면 `_qc_results/golden_cache.json`에 주파수/곡선이 저장되어 이후 FAIL 데이터를 추가해도 동일한 기준으로 비교한다.
+- CLI에서는 `--lock_golden` (필요 시 `--golden_cache_path custom.json`)을 추가하면 동일하게 스냅샷을 재사용한다.
+- 새로운 기준이 필요하면 GUI의 "캐시 초기화" 버튼을 누르거나 캐시 파일을 삭제한 뒤 다시 Auto 골든을 생성한다.
 
 Shot-Aware 사용법:
 - Shot-Aware 모드 ON → 샷 정규식 입력 → 샷 최소 개수 설정(기본 3) → 샷 보정 사용 체크.
@@ -723,6 +731,36 @@ class ShotGolden:
         return (out - self.correction_offset) / self.correction_scale
 
 
+def _shot_golden_to_dict(sg: ShotGolden) -> Dict:
+    return dict(
+        shot_id=sg.shot_id,
+        freq=sg.freq.tolist(),
+        global_curve=sg.global_curve.tolist(),
+        shot_curve=sg.shot_curve.tolist(),
+        correction_poly=(None if sg.correction_poly is None else list(map(float, sg.correction_poly))),
+        correction_offset=float(sg.correction_offset),
+        correction_scale=float(sg.correction_scale),
+    )
+
+
+def _shot_golden_from_dict(obj: Dict) -> ShotGolden:
+    freq = np.asarray(obj.get('freq', []), float)
+    g_curve = np.asarray(obj.get('global_curve', []), float)
+    s_curve = np.asarray(obj.get('shot_curve', []), float)
+    poly = obj.get('correction_poly')
+    if poly is not None:
+        poly = np.asarray(poly, float)
+    return ShotGolden(
+        shot_id=obj.get('shot_id', 'UNKNOWN'),
+        freq=freq,
+        global_curve=g_curve,
+        shot_curve=s_curve,
+        correction_poly=poly,
+        correction_offset=float(obj.get('correction_offset', 0.0)),
+        correction_scale=float(obj.get('correction_scale', 1.0)),
+    )
+
+
 @dataclass
 class QCResult:
     path: str
@@ -791,9 +829,12 @@ def classify_folder(root: str, golden_mode: str, golden_path: Optional[str], fmi
                     shot_aware: bool=False, shot_regex: Optional[str]=None,
                     shot_min_members: int=3, shot_use_correction: bool=True, shot_relax: float=1.15,
                     shape_guard_strength: float=1.0, linearity_guard_strength: float=1.0,
-                    notch_guard_strength: float=1.0, label_map_csv: Optional[str]=None
+                    notch_guard_strength: float=1.0, label_map_csv: Optional[str]=None,
+                    lock_golden: bool=False, golden_cache_path: Optional[str]=None
                     ) -> Tuple[List[QCResult], Tuple[float,float], Tuple[np.ndarray,np.ndarray], Dict[str, ShotGolden]]:
     import re
+    root_abs = os.path.abspath(root)
+    golden_path_abs = os.path.abspath(golden_path) if golden_path else None
     s1p_files = []
     pat = re.compile(regex) if (regex and regex.strip()) else None
     for dp,_,fns in os.walk(root):
@@ -805,23 +846,60 @@ def classify_folder(root: str, golden_mode: str, golden_path: Optional[str], fmi
     s1p_files.sort()
     if not s1p_files: raise RuntimeError("대상 s1p 파일을 찾지 못했습니다.")
 
-    if golden_mode == 'auto':
-        g_freq, g_curve = build_golden_auto(s1p_files, domain)
-    elif golden_mode == 'single':
-        if not golden_path: raise RuntimeError("Golden 단일 파일 경로가 비었습니다.")
-        g_freq, g_curve = build_golden_single(golden_path, domain)
-    elif golden_mode == 'folder':
-        if not golden_path: raise RuntimeError("Golden 폴더 경로가 비었습니다.")
-        if not os.path.isdir(golden_path): raise RuntimeError("Golden 폴더가 존재하지 않습니다.")
-        g_freq, g_curve = build_golden_folder(golden_path, domain)
-    else:
-        raise RuntimeError("알 수 없는 golden_mode")
+    cache_enabled = bool(lock_golden and golden_cache_path)
+    cache_loaded = False
+    cached_shots: Dict[str, ShotGolden] = {}
+    g_freq: Optional[np.ndarray] = None
+    g_curve: Optional[np.ndarray] = None
 
-    shot_goldens: Dict[str, ShotGolden] = {}
-    if shot_aware:
+    if cache_enabled and os.path.isfile(golden_cache_path):
         try:
-            shot_goldens = build_shot_goldens(s1p_files, domain, shot_regex, shot_min_members,
-                                              g_freq, g_curve, enable_correction=shot_use_correction)
+            cache_obj = load_golden_cache(golden_cache_path)
+            meta_ok = (
+                cache_obj.get('root') == root_abs and
+                cache_obj.get('domain') == domain and
+                cache_obj.get('compare_mode', compare_mode) == compare_mode and
+                cache_obj.get('golden_mode') == golden_mode and
+                (cache_obj.get('golden_path') or None) == golden_path_abs
+            )
+            gg = cache_obj.get('global_golden', {}) if cache_obj else {}
+            freq_cache = np.asarray(gg.get('freq', []), float)
+            curve_cache = np.asarray(gg.get('curve', []), float)
+            if meta_ok and freq_cache.size and curve_cache.size:
+                g_freq = freq_cache
+                g_curve = curve_cache
+                cache_loaded = True
+                print(f"[정보] Golden cache 로드: {golden_cache_path}")
+                shots_obj = cache_obj.get('shots', {}) if cache_obj else {}
+                for sid, payload in shots_obj.items():
+                    try:
+                        cached_shots[sid] = _shot_golden_from_dict(payload)
+                    except Exception:
+                        continue
+            else:
+                print("[경고] Golden cache 메타데이터 불일치 또는 빈 데이터 - 재계산", file=sys.stderr)
+        except Exception as e:
+            print(f"[경고] Golden cache 로드 실패: {e}", file=sys.stderr)
+
+    if g_freq is None or g_curve is None:
+        if golden_mode == 'auto':
+            g_freq, g_curve = build_golden_auto(s1p_files, domain)
+        elif golden_mode == 'single':
+            if not golden_path: raise RuntimeError("Golden 단일 파일 경로가 비었습니다.")
+            g_freq, g_curve = build_golden_single(golden_path, domain)
+        elif golden_mode == 'folder':
+            if not golden_path: raise RuntimeError("Golden 폴더 경로가 비었습니다.")
+            if not os.path.isdir(golden_path): raise RuntimeError("Golden 폴더가 존재하지 않습니다.")
+            g_freq, g_curve = build_golden_folder(golden_path, domain)
+        else:
+            raise RuntimeError("알 수 없는 golden_mode")
+
+    shot_goldens: Dict[str, ShotGolden] = dict(cached_shots)
+    if shot_aware and (not cache_loaded or not lock_golden):
+        try:
+            built = build_shot_goldens(s1p_files, domain, shot_regex, shot_min_members,
+                                       g_freq, g_curve, enable_correction=shot_use_correction)
+            shot_goldens.update(built)
         except Exception as e:
             print(f"[경고] Shot golden 생성 실패: {e}", file=sys.stderr)
 
@@ -1017,6 +1095,15 @@ def classify_folder(root: str, golden_mode: str, golden_path: Optional[str], fmi
         print(f"[혼동행렬] TP={confusion['TP']} TN={confusion['TN']} FP={confusion['FP']} FN={confusion['FN']} (총 {total})")
         print(f"[지표] FP rate={fp_rate:.2f}% / FN rate={fn_rate:.2f}%")
 
+    if cache_enabled and not cache_loaded and golden_cache_path:
+        try:
+            save_golden_cache(golden_cache_path, root_abs, domain, compare_mode, golden_mode,
+                              golden_path_abs,
+                              g_freq, g_curve, shot_goldens if shot_aware else {})
+            print(f"[정보] Golden cache 저장: {golden_cache_path}")
+        except Exception as e:
+            print(f"[경고] Golden cache 저장 실패: {e}", file=sys.stderr)
+
     return results, (use_r, use_e), (g_freq, g_curve), shot_goldens
 
 # ============================ Save/Load (CSV 확장) ============================
@@ -1055,6 +1142,40 @@ def load_thresholds(root: str) -> Tuple[float,float]:
     with open(path, 'r', encoding='utf-8') as f:
         obj = json.load(f)
     return float(obj["r_min"]), float(obj["rmse_max"])
+
+
+def golden_cache_file(root: str) -> str:
+    out_dir = os.path.join(root, "_qc_results"); os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, "golden_cache.json")
+
+
+def save_golden_cache(path: str, root: str, domain: str, compare_mode: str, golden_mode: str,
+                      golden_path: Optional[str], freq: np.ndarray, curve: np.ndarray,
+                      shot_goldens: Dict[str, ShotGolden]) -> None:
+    data = dict(
+        root=os.path.abspath(root),
+        domain=domain,
+        compare_mode=compare_mode,
+        golden_mode=golden_mode,
+        golden_path=(None if golden_path is None else os.path.abspath(golden_path)),
+        global_golden=dict(freq=freq.tolist(), curve=curve.tolist()),
+        shots={sid: _shot_golden_to_dict(sg) for sid, sg in shot_goldens.items()},
+    )
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def load_golden_cache(path: str) -> Dict:
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+def clear_golden_cache(path: str) -> None:
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
 
 # ============================ GUI ============================
 
@@ -1129,6 +1250,22 @@ def launch_gui():
         pass_label.configure(text=f"PASS {n_pass} ({p_pass:.1f}%)", foreground="#0a7d00")
         fail_label.configure(text=f"FAIL {n_fail} ({100.0-p_pass:.1f}%)", foreground="#c20000")
         total_label.configure(text=f"총 {total}개")
+
+    def on_reset_golden_cache():
+        root_dir = root_var.get().strip()
+        if not root_dir:
+            messagebox.showwarning("경고", "먼저 --root 폴더를 선택하세요.")
+            return
+        if not os.path.isdir(root_dir):
+            messagebox.showwarning("경고", "폴더가 존재하지 않습니다: " + root_dir)
+            return
+        path = golden_cache_file(root_dir)
+        existed = os.path.isfile(path)
+        clear_golden_cache(path)
+        if existed:
+            messagebox.showinfo("초기화", f"Golden 스냅샷을 삭제했습니다.\n({path})")
+        else:
+            messagebox.showinfo("안내", "삭제할 Golden 캐시가 없습니다.")
 
     # plotting state
     state = {"g_freq":None, "g_curve":None, "domain":"Y11_DB", "fmin":None, "fmax":None, "compare":"RAW", "shot_map":{}}
@@ -1360,6 +1497,8 @@ def launch_gui():
             try: notch_strength = float(var_notch_strength.get() or "1.0")
             except Exception: notch_strength = 1.0
             label_map_path = label_map_var.get().strip() or None
+            lock_golden = bool(var_lock_golden.get())
+            golden_cache = golden_cache_file(root_dir) if lock_golden else None
 
             if auto:
                 use_r, use_e = None, None
@@ -1385,6 +1524,8 @@ def launch_gui():
             _log(f"        strict-noise={strict_noise_val:.3f}dB ({strict_mode}) | rough_max={g_rough} min_prom={g_minprom} max_fwhm={g_maxfwhm}")
             _log(f"        2-stage={use_two} relax={relax} | ML={ml_use}({ml_mode}) model={ml_model_path} | S11-CC={cc_use}({cc_mode}, x{cc_relax})")
             _log(f"        Shot={shot_enable} regex={shot_regex} min={shot_min} corr={shot_corr} relax={shot_relax} | guards S={shape_strength} L={linear_strength} N={notch_strength}")
+            if lock_golden:
+                _log(f"        Golden lock=ON cache={golden_cache}")
 
             results, (used_r, used_e), (g_freq, g_curve), shot_map = classify_folder(
                 root=root_dir, golden_mode=gmode, golden_path=gpath, fmin=fmin, fmax=fmax,
@@ -1399,7 +1540,8 @@ def launch_gui():
                 shot_aware=shot_enable, shot_regex=shot_regex, shot_min_members=shot_min,
                 shot_use_correction=shot_corr, shot_relax=shot_relax,
                 shape_guard_strength=shape_strength, linearity_guard_strength=linear_strength,
-                notch_guard_strength=notch_strength, label_map_csv=label_map_path
+                notch_guard_strength=notch_strength, label_map_csv=label_map_path,
+                lock_golden=lock_golden, golden_cache_path=golden_cache
             )
             _log(f"[완료] r_min={used_r:.5f}, rmse_max={used_e:.5f} dB")
             if shot_enable:
@@ -1501,6 +1643,8 @@ def launch_gui():
         "1) ML 학습: GOOD/BAD 폴더 지정 → Fit&Save → 모델 저장(JSON)\n"
         "2) 분류: --root 지정 → (필요시 Load Thresholds) → 2-Stage/ML/S11-CC 옵션 조절 → 실행\n"
         "3) CSV의 stage/ML/s11_cc/shot/guards 열에서 사유 확인\n"
+        "'골든 고정'을 켜면 Auto 골든을 `_qc_results/golden_cache.json`에 저장하여 FAIL 샘플을 추가해도 기준이 흔들리지 않습니다. '캐시 초기화'로 재계산하세요.\n"
+        "'간편 프리셋'에서 기본/양품 보호/불량 차단을 선택하면 주요 Gate·Shot·ML 값이 즉시 세팅됩니다.\n"
         "Shot-Aware 패널: 샷 정규식, 최소 개수, 보정 옵션 설정 후 FLEX 완화(Shot relax ×).\n"
         "Shape/Linearity/Notch 강도를 높이면 노치/평탄/멀티피크/잡음을 더 엄격히 탐지합니다.\n"
         "Strict Noise Guard (dB)을 줄이면 Y11 미세 노이즈도 FAIL 처리, 0 입력 시 비활성입니다.\n"
@@ -1545,12 +1689,17 @@ def launch_gui():
     ttk.Entry(thr_box, textvariable=rmse_var, width=10).pack(side='left')
     var_lock_thresholds = tk.BooleanVar(value=False)
     ttk.Checkbutton(ctl, text="임계값 고정", variable=var_lock_thresholds).grid(row=7, column=2, sticky='w', padx=(4,0))
+    var_lock_golden = tk.BooleanVar(value=False)
+    gold_lock_box = ttk.Frame(ctl)
+    gold_lock_box.grid(row=7, column=3, sticky='w', padx=(4,0))
+    ttk.Checkbutton(gold_lock_box, text="골든 고정", variable=var_lock_golden).pack(side='left')
+    ttk.Button(gold_lock_box, text="캐시 초기화", command=on_reset_golden_cache).pack(side='left', padx=(4,0))
 
     ttk.Label(ctl, text="타깃 통과율(%)").grid(row=8, column=0, sticky='w')
     passrate_var = tk.StringVar(value="98")
     ttk.Entry(ctl, textvariable=passrate_var, width=6).grid(row=8, column=1, sticky='w', padx=(5,0))
 
-    btns = ttk.Frame(ctl); btns.grid(row=9, column=0, columnspan=4, sticky='w', pady=8)
+    btns = ttk.Frame(ctl); btns.grid(row=10, column=0, columnspan=4, sticky='w', pady=8)
     ttk.Button(btns, text="Auto 추천(MAD)", command=on_auto_mad).pack(side='left', padx=3)
     ttk.Button(btns, text="Calibrate(양품→Save)", command=on_calibrate_save).pack(side='left', padx=3)
     ttk.Button(btns, text="Load Thresholds", command=on_load_thresholds).pack(side='left', padx=3)
@@ -1668,7 +1817,7 @@ def launch_gui():
     ttk.Entry(gatefrm, textvariable=var_max_fwhm, width=8).grid(row=4, column=1, sticky='w', padx=4)
 
     ttk.Label(gatefrm, text="Strict noise (dB)").grid(row=5, column=0, sticky='w', padx=4)
-    var_strict_noise = tk.StringVar(value="0.12")
+    var_strict_noise = tk.StringVar(value="0.0")
     ttk.Entry(gatefrm, textvariable=var_strict_noise, width=8).grid(row=5, column=1, sticky='w', padx=4)
     ttk.Label(gatefrm, text="Strict mode").grid(row=5, column=2, sticky='e', padx=4)
     strict_noise_mode_var = tk.StringVar(value="FAIL")
@@ -1753,6 +1902,54 @@ def launch_gui():
     var_s11_relax = tk.StringVar(value="1.25")
     ttk.Entry(mlfrm, textvariable=var_s11_relax, width=6).grid(row=7, column=2, sticky='w', padx=4)
 
+    def apply_preset(name: str):
+        name = (name or '').strip()
+        if name == '양품 보호':
+            var_use_noise.set(True); var_use_shape.set(True)
+            gate_mode_var.set('WARN')
+            var_smooth_win.set('41'); var_rough_max.set('0.35')
+            var_min_prom.set('0.8'); var_max_fwhm.set('220.0')
+            var_strict_noise.set('0.0'); strict_noise_mode_var.set('WARN')
+            var_shot_aware.set(True); var_shot_relax.set('1.25')
+            var_shape_strength.set('0.8'); var_linear_strength.set('0.9'); var_notch_strength.set('0.9')
+            var_use_two_stage.set(True); var_relax.set('1.30')
+            var_use_ml.set(True); ml_mode_var.set('WARN')
+            preset_var.set('양품 보호')
+        elif name == '불량 차단':
+            var_use_noise.set(True); var_use_shape.set(True)
+            gate_mode_var.set('FAIL')
+            var_smooth_win.set('21'); var_rough_max.set('0.18')
+            var_min_prom.set('1.2'); var_max_fwhm.set('150.0')
+            var_strict_noise.set('0.12'); strict_noise_mode_var.set('FAIL')
+            var_shot_aware.set(True); var_shot_relax.set('1.05')
+            var_shape_strength.set('1.2'); var_linear_strength.set('1.2'); var_notch_strength.set('1.2')
+            var_use_two_stage.set(True); var_relax.set('1.15')
+            var_use_ml.set(True); ml_mode_var.set('FAIL')
+            preset_var.set('불량 차단')
+        else:
+            var_use_noise.set(False); var_use_shape.set(False)
+            gate_mode_var.set('WARN')
+            var_smooth_win.set('31'); var_rough_max.set('0.25')
+            var_min_prom.set('1.0'); var_max_fwhm.set('180.0')
+            var_strict_noise.set('0.0'); strict_noise_mode_var.set('FAIL')
+            var_shot_aware.set(True); var_shot_relax.set('1.15')
+            var_shape_strength.set('1.0'); var_linear_strength.set('1.0'); var_notch_strength.set('1.0')
+            var_use_two_stage.set(True); var_relax.set('1.25')
+            var_use_ml.set(True); ml_mode_var.set('WARN')
+            preset_var.set('기본')
+
+    preset_var = tk.StringVar(value='기본')
+    preset_frame = ttk.Frame(ctl)
+    preset_frame.grid(row=9, column=0, columnspan=4, sticky='w', pady=(4,0))
+    ttk.Label(preset_frame, text="간편 프리셋").pack(side='left', padx=(0,4))
+    preset_combo = ttk.Combobox(preset_frame, textvariable=preset_var,
+                                values=('기본','양품 보호','불량 차단'), width=10, state='readonly')
+    preset_combo.pack(side='left')
+    ttk.Button(preset_frame, text="프리셋 적용", command=lambda: apply_preset(preset_var.get())).pack(side='left', padx=(6,4))
+    ttk.Button(preset_frame, text="기본값 복구", command=lambda: apply_preset('기본')).pack(side='left')
+    preset_combo.bind("<<ComboboxSelected>>", lambda _e: apply_preset(preset_var.get()))
+    apply_preset('기본')
+
     def on_domain_change(*_):
         state["domain"] = 'S11_DB' if domain_var.get()=="S11(dB)" else 'Y11_DB'
     domain_var.trace_add('write', on_domain_change)
@@ -1780,7 +1977,7 @@ def main():
     pc.add_argument('--gate_mode', choices=['WARN','FAIL'], default='WARN')
     pc.add_argument('--smoothing_window_pts', type=int, default=31)
     pc.add_argument('--roughness_max_db', type=float, default=0.25)
-    pc.add_argument('--strict_noise_db', type=float, default=0.12)
+    pc.add_argument('--strict_noise_db', type=float, default=0.0)
     pc.add_argument('--strict_noise_mode', choices=['WARN','FAIL'], default='FAIL')
     pc.add_argument('--min_prom_db', type=float, default=1.0)
     pc.add_argument('--max_fwhm_mhz', type=float, default=180.0)
@@ -1801,6 +1998,8 @@ def main():
     pc.add_argument('--linearity_guard_strength', type=float, default=1.0)
     pc.add_argument('--notch_guard_strength', type=float, default=1.0)
     pc.add_argument('--label_map_csv')
+    pc.add_argument('--lock_golden', action='store_true')
+    pc.add_argument('--golden_cache_path')
 
     # fit-ml
     pf = sub.add_parser('fit')
@@ -1833,6 +2032,7 @@ def main():
         return
 
     if args.cmd=='classify':
+        cache_path = args.golden_cache_path or (golden_cache_file(args.root) if args.lock_golden else None)
         results, (rmin, ermse), _, _ = classify_folder(
             root=args.root, golden_mode=args.golden_mode, golden_path=args.golden_path,
             fmin=args.freq_min, fmax=args.freq_max, r_min=args.r_min, rmse_max=args.rmse_max,
@@ -1848,8 +2048,11 @@ def main():
             shot_min_members=args.shot_min_members, shot_use_correction=args.shot_use_correction,
             shot_relax=args.shot_relax, shape_guard_strength=args.shape_guard_strength,
             linearity_guard_strength=args.linearity_guard_strength,
-            notch_guard_strength=args.notch_guard_strength, label_map_csv=args.label_map_csv
+            notch_guard_strength=args.notch_guard_strength, label_map_csv=args.label_map_csv,
+            lock_golden=args.lock_golden, golden_cache_path=cache_path
         )
+        if args.lock_golden:
+            print(f"[INFO] Golden cache path: {cache_path}")
         out_csv = save_results_csv(args.root, results, rmin, ermse)
         print(f"CSV: {out_csv}")
         n_pass = sum(1 for r in results if r.decision=='PASS'); n_fail=len(results)-n_pass
