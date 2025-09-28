@@ -27,6 +27,7 @@ STRICT superset of rev4.0 (원코드 삭제/수정 없음, 기능만 추가).
    - shot_id, used_golden(global/shot), guards(note) 열 추가, 혼동행렬(FP/FN) 및 통계 출력.
 7) GUI & CLI 옵션 추가
    - Shot-aware 토글, 샷 정규식/최소 샷수, 보정 활성화, Guard 강도 조절, ROI 설정 강화.
+   - 좌측 제어 패널은 스크롤을 지원하여 Noise/Shape, Shot, ML, S11 옵션을 한눈에 탐색.
 
 의존성: numpy, tkinter, matplotlib (scikit-learn 불필요; LDA는 내장구현)
 """
@@ -50,6 +51,8 @@ README_TEXT = r"""
 실행 흐름:
 1) GUI 실행: python qc_thresholds_autoscan_unified_pro_ml_rev6_0_shotaware.py
    - 좌측에서 --root를 지정 후 Auto 추천 또는 Load Thresholds.
+   - "임계값 고정" 체크를 켜면 Auto/MAD/Quantile로 얻은 r_min, rmse_max를 그대로 사용한다.
+   - 좌측 패널은 마우스 휠로 스크롤 가능하며 Gate / Shot / ML / Cross-check 섹션을 순서대로 배치했다.
    - Shot-Aware 모드를 ON으로 두면 샷 정규식(기본 SHOT(\d+))과 최소 샷 개수를 기준으로 로컬 골든을 생성.
    - Strict Noise Guard 슬라이더/입력으로 Y11 곡선에서 미세 노이즈도 FAIL로 처리할 강도를 지정.
    - ML/교차검증 패널에서 GOOD/BAD 폴더로 LDA 학습 후 모델 저장/불러오기.
@@ -1221,6 +1224,7 @@ def launch_gui():
             mets = [compute_metrics(parse_s1p(p), g_freq, g_curve, fmin, fmax, domain, compare_mode) for p in files]
             rmin, ermse = auto_thresholds_mad(mets, k_sigma=3.0)
             rmin_var.set(f"{rmin:.5f}"); rmse_var.set(f"{ermse:.5f}")
+            var_lock_thresholds.set(True)
             messagebox.showinfo("추천 임계값(MAD)", f"r_min={rmin:.5f}\nrmse_max={ermse:.5f} dB\n(저장되지 않았습니다)")
         except Exception as e:
             messagebox.showerror("실패", str(e))
@@ -1242,6 +1246,7 @@ def launch_gui():
             mets = [compute_metrics(parse_s1p(p), g_freq, g_curve, fmin, fmax, domain, compare_mode) for p in files]
             rmin, ermse = auto_thresholds_quantile(mets, pass_rate=pass_rate)
             rmin_var.set(f"{rmin:.5f}"); rmse_var.set(f"{ermse:.5f}")
+            var_lock_thresholds.set(True)
             save_path = save_thresholds(root_dir, rmin, ermse)
             messagebox.showinfo("Calibrate 저장", f"r_min={rmin:.5f}\nrmse_max={ermse:.5f} dB\n저장: {save_path}")
         except Exception as e:
@@ -1253,6 +1258,7 @@ def launch_gui():
             if not root_dir: messagebox.showwarning("경고","--root 폴더를 선택하세요."); return
             rmin, ermse = load_thresholds(root_dir)
             rmin_var.set(f"{rmin:.5f}"); rmse_var.set(f"{ermse:.5f}")
+            var_lock_thresholds.set(True)
             messagebox.showinfo("불러오기 완료", f"r_min={rmin:.5f}\nrmse_max={ermse:.5f} dB")
         except Exception as e:
             messagebox.showerror("실패", str(e))
@@ -1355,11 +1361,24 @@ def launch_gui():
             except Exception: notch_strength = 1.0
             label_map_path = label_map_var.get().strip() or None
 
-            if auto: use_r, use_e = None, None; gmode = _gmode(); gpath = golden_path_var.get().strip() or None
+            if auto:
+                use_r, use_e = None, None
+                gmode = _gmode(); gpath = golden_path_var.get().strip() or None
             else:
                 gmode = _gmode(); gpath = golden_path_var.get().strip() or None
-                use_r = float(rmin_var.get()) if rmin_var.get().strip() else None
-                use_e = float(rmse_var.get()) if rmse_var.get().strip() else None
+                if var_lock_thresholds.get():
+                    try:
+                        use_r = float(rmin_var.get().strip())
+                    except Exception:
+                        messagebox.showerror("입력 오류", "임계값 r_min을 숫자로 입력하세요.")
+                        return
+                    try:
+                        use_e = float(rmse_var.get().strip())
+                    except Exception:
+                        messagebox.showerror("입력 오류", "임계값 rmse_max를 숫자로 입력하세요.")
+                        return
+                else:
+                    use_r, use_e = None, None
 
             _log(f"[진행] classify: domain={domain}, compare={compare_mode}, golden={gmode}, path={gpath}, f=[{fmin},{fmax}], regex={regex}")
             _log(f"        gates: noise={g_use_noise}, shape={g_use_shape}, mode={g_gate_mode}, smooth={g_smooth}")
@@ -1431,9 +1450,48 @@ def launch_gui():
     frm.columnconfigure(0, weight=0); frm.columnconfigure(1, weight=1)
     frm.rowconfigure(0, weight=1)
 
-    # Left column
-    left = ttk.Frame(frm); left.grid(row=0, column=0, sticky='nsw')
+    # Left column with scrollbar so gate/ML 패널이 모두 보인다
+    left_container = ttk.Frame(frm)
+    left_container.grid(row=0, column=0, sticky='nsw')
+    left_container.rowconfigure(0, weight=1)
+    left_container.columnconfigure(0, weight=1)
+
+    left_canvas = tk.Canvas(left_container, highlightthickness=0, borderwidth=0, width=600)
+    left_scroll = ttk.Scrollbar(left_container, orient='vertical', command=left_canvas.yview)
+    left_canvas.grid(row=0, column=0, sticky='nsw')
+    left_scroll.grid(row=0, column=1, sticky='ns')
+    left_canvas.configure(yscrollcommand=left_scroll.set)
+
+    left = ttk.Frame(left_canvas)
+    left_window = left_canvas.create_window((0, 0), window=left, anchor='nw')
+
+    def _sync_left_scrollregion(_event=None):
+        left_canvas.configure(scrollregion=left_canvas.bbox('all'))
+    left.bind('<Configure>', _sync_left_scrollregion)
+
+    def _stretch_left_frame(event):
+        left_canvas.itemconfigure(left_window, width=event.width)
+    left_canvas.bind('<Configure>', _stretch_left_frame)
+
+    def _on_mousewheel(event):
+        if getattr(event, 'num', None) == 4 or getattr(event, 'delta', 0) > 0:
+            left_canvas.yview_scroll(-1, 'units')
+        elif getattr(event, 'num', None) == 5 or getattr(event, 'delta', 0) < 0:
+            left_canvas.yview_scroll(1, 'units')
+
+    def _bind_scroll(widget):
+        widget.bind('<Enter>', lambda _e: (win.bind_all('<MouseWheel>', _on_mousewheel),
+                                          win.bind_all('<Button-4>', _on_mousewheel),
+                                          win.bind_all('<Button-5>', _on_mousewheel)))
+        widget.bind('<Leave>', lambda _e: (win.unbind_all('<MouseWheel>'),
+                                          win.unbind_all('<Button-4>'),
+                                          win.unbind_all('<Button-5>')))
+
+    _bind_scroll(left_canvas)
+    _bind_scroll(left)
+
     ctl = ttk.Frame(left); ctl.pack(fill='x')
+    _bind_scroll(ctl)
 
     ttk.Label(ctl, text="--root").grid(row=0, column=0, sticky='w')
     root_var = tk.StringVar(); ttk.Entry(ctl, textvariable=root_var, width=46).grid(row=0, column=1, sticky='w', padx=5)
@@ -1485,6 +1543,8 @@ def launch_gui():
     thr_box = ttk.Frame(ctl); thr_box.grid(row=7, column=1, sticky='w', padx=5)
     ttk.Entry(thr_box, textvariable=rmin_var, width=10).pack(side='left', padx=(0,6))
     ttk.Entry(thr_box, textvariable=rmse_var, width=10).pack(side='left')
+    var_lock_thresholds = tk.BooleanVar(value=False)
+    ttk.Checkbutton(ctl, text="임계값 고정", variable=var_lock_thresholds).grid(row=7, column=2, sticky='w', padx=(4,0))
 
     ttk.Label(ctl, text="타깃 통과율(%)").grid(row=8, column=0, sticky='w')
     passrate_var = tk.StringVar(value="98")
@@ -1497,8 +1557,12 @@ def launch_gui():
     ttk.Button(btns, text="원클릭 분류(Easy)", command=on_oneclick).pack(side='left', padx=3)
     ttk.Button(btns, text="분류 실행", command=on_classify).pack(side='left', padx=3)
 
+    ttk.Label(left, text="▼ 아래 스크롤하면 Gate / Shot / ML / Cross-check 패널이 나타납니다.",
+              foreground="#0b5394").pack(fill='x', pady=(2,6))
+
     # PASS/FAIL lists
     lists = ttk.Frame(left); lists.pack(fill='both', expand=True, pady=(10,6))
+    _bind_scroll(lists)
     pass_header = ttk.Label(lists, text="PASS 목록"); fail_header = ttk.Label(lists, text="FAIL 목록")
     pass_header.grid(row=0, column=0, sticky='w'); fail_header.grid(row=0, column=1, sticky='w')
     pass_xsb = ttk.Scrollbar(lists, orient='horizontal'); fail_xsb = ttk.Scrollbar(lists, orient='horizontal')
@@ -1576,6 +1640,7 @@ def launch_gui():
     # ----- Gates panel (v3.8) -----
     gatefrm = ttk.LabelFrame(left, text="Noise/Shape Gate (v3.8)")
     gatefrm.pack(fill='x', pady=(6,4))
+    _bind_scroll(gatefrm)
 
     var_use_noise = tk.BooleanVar(value=False)
     var_use_shape = tk.BooleanVar(value=False)
@@ -1612,6 +1677,7 @@ def launch_gui():
     # ----- Shot-aware / Shape 강화 (rev5.0) -----
     shotfrm = ttk.LabelFrame(left, text="Shot-Aware / Shape Guards (rev6.0)")
     shotfrm.pack(fill='x', pady=(6,4))
+    _bind_scroll(shotfrm)
 
     var_shot_aware = tk.BooleanVar(value=True)
     ttk.Checkbutton(shotfrm, text="Shot-Aware 모드", variable=var_shot_aware).grid(row=0, column=0, sticky='w', padx=4, pady=2)
@@ -1648,6 +1714,7 @@ def launch_gui():
     # ----- ML / Cross-check panel -----
     mlfrm = ttk.LabelFrame(left, text="ML / Cross-check (rev6.0)")
     mlfrm.pack(fill='x', pady=(8,6))
+    _bind_scroll(mlfrm)
 
     good_root_var = tk.StringVar(); bad_root_var = tk.StringVar()
     ttk.Label(mlfrm, text="GOOD 폴더").grid(row=0, column=0, sticky='w', padx=4)
