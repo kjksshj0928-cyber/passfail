@@ -15,6 +15,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Sequence
 
+try:  # pragma: no cover - import guard for runtime convenience
+    import tkinter as tk
+except Exception:  # pragma: no cover - fallback for environments without Tk
+    tk = None  # type: ignore
+
 
 @dataclass
 class Record:
@@ -95,4 +100,35 @@ class App:
 
 
 __all__ = ["App", "Record"]
+
+
+def main() -> None:  # pragma: no cover - user convenience entry point
+    """Launch a very small placeholder window so the script can "open"."""
+
+    if tk is None:
+        raise RuntimeError(
+            "Tkinter is not available in this environment; the GUI stub cannot start."
+        )
+
+    root = tk.Tk()
+    root.title("Resonator QC Unified (stub)")
+    label = tk.Label(
+        root,
+        text=(
+            "This kata only ships a minimal stub of the original application.\n"
+            "AutoBand helpers can be exercised from tests, and this placeholder\n"
+            "window exists so running the script still produces a visible UI."
+        ),
+        justify="center",
+        padx=24,
+        pady=16,
+    )
+    label.pack()
+    button = tk.Button(root, text="Close", command=root.destroy)
+    button.pack(pady=(0, 16))
+    root.mainloop()
+
+
+if __name__ == "__main__":  # pragma: no cover - script entry point
+    main()
 
